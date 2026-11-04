@@ -19,7 +19,9 @@ open class OpenCodeApiClient(
     private val port: Int,
     private val username: String? = null,
     private val password: String? = null
-) {
+) : OpenCodeApi {
+
+    override val protocol: OpenCodeProtocol = OpenCodeProtocol.V1
 
     private val logger = Logger.getInstance(OpenCodeApiClient::class.java)
     private val baseUrl = "http://$hostname:$port"
@@ -47,14 +49,14 @@ open class OpenCodeApiClient(
         .registerTypeAdapter(FileDiff::class.java, FileDiffDeserializer())
         .create()
 
-    fun getSessions(directory: String): List<Session> {
+    override fun getSessions(directory: String): List<Session> {
         val serverPath = PathUtil.toOpenCodeServerPath(directory)
         val url = "$baseUrl/session?directory=${encode(serverPath)}"
         val type = object : TypeToken<List<Session>>() {}.type
         return get(url, type) ?: emptyList()
     }
 
-    fun getSessionStatuses(directory: String): List<SessionStatus> {
+    override fun getSessionStatuses(directory: String): List<SessionStatus> {
         val serverPath = PathUtil.toOpenCodeServerPath(directory)
         val url = "$baseUrl/session/status?directory=${encode(serverPath)}"
         val mapType = object : TypeToken<Map<String, SessionStatusType>>() {}.type
@@ -62,11 +64,11 @@ open class OpenCodeApiClient(
         return map.map { (id, statusType) -> SessionStatus(id, statusType) }
     }
 
-    fun findBusySession(directory: String): SessionStatus? {
+    override fun findBusySession(directory: String): SessionStatus? {
         return getSessionStatuses(directory).find { it.status.isBusy() }
     }
 
-    open fun getSessionDiff(sessionId: String, directory: String, messageId: String? = null): List<FileDiff> {
+    override fun getSessionDiff(sessionId: String, directory: String, messageId: String?): List<FileDiff> {
         val serverPath = PathUtil.toOpenCodeServerPath(directory)
         var url = "$baseUrl/session/$sessionId/diff?directory=${encode(serverPath)}"
         if (messageId != null) url += "&messageID=$messageId"
@@ -87,34 +89,28 @@ open class OpenCodeApiClient(
     /**
      * Get a specific session by ID.
      */
-    open fun getSession(sessionId: String, directory: String): Session? {
+    override fun getSession(sessionId: String, directory: String): Session? {
         val serverPath = PathUtil.toOpenCodeServerPath(directory)
         val url = "$baseUrl/session/$sessionId?directory=${encode(serverPath)}"
         return get(url, Session::class.java)
     }
 
-    fun checkHealth(directory: String): Boolean {
-        return try {
-            val url = "$baseUrl/global/health"
-            val request = Request.Builder().url(url).get().build()
-            client.newCall(request).execute().use { it.isSuccessful }
-        } catch (e: Exception) {
-            false
-        }
+    override fun checkHealth(directory: String): Boolean {
+        return ProtocolDetector.isV1Healthy(hostname, port, username, password)
     }
 
-    fun createEventListener(
+    override fun createEventListener(
         directory: String,
         onEvent: (OpenCodeEvent) -> Unit,
         onError: (Throwable) -> Unit,
-        onConnected: () -> Unit = {},
-        onDisconnected: () -> Unit = {}
+        onConnected: () -> Unit,
+        onDisconnected: () -> Unit
     ): SseEventListener {
         val serverPath = PathUtil.toOpenCodeServerPath(directory)
         return SseEventListener(baseUrl, serverPath, onEvent, onError, onConnected, onDisconnected, username, password)
     }
 
-    fun tuiAppendPrompt(text: String): Boolean {
+    override fun tuiAppendPrompt(text: String): Boolean {
         val url = "$baseUrl/tui/append-prompt"
         val body = TuiAppendPromptRequest(text)
         return post(url, body) != null

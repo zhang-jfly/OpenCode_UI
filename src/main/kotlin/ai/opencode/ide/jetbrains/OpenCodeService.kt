@@ -1,8 +1,12 @@
 package ai.opencode.ide.jetbrains
 
+import ai.opencode.ide.jetbrains.api.OpenCodeApi
 import ai.opencode.ide.jetbrains.api.OpenCodeApiClient
+import ai.opencode.ide.jetbrains.api.OpenCodeProtocol
+import ai.opencode.ide.jetbrains.api.ProtocolDetector
 import ai.opencode.ide.jetbrains.api.SseEventListener
 import ai.opencode.ide.jetbrains.api.models.*
+import ai.opencode.ide.jetbrains.api.v2.OpenCodeV2ApiClient
 import ai.opencode.ide.jetbrains.diff.DiffViewerService
 import ai.opencode.ide.jetbrains.session.SessionManager
 import ai.opencode.ide.jetbrains.session.TurnSnapshot
@@ -11,6 +15,8 @@ import ai.opencode.ide.jetbrains.terminal.OpenCodeTerminalFileEditorProvider
 import ai.opencode.ide.jetbrains.terminal.OpenCodeTerminalLinkFilter
 import ai.opencode.ide.jetbrains.terminal.OpenCodeTerminalVirtualFile
 import ai.opencode.ide.jetbrains.ui.OpenCodeConnectDialog
+import ai.opencode.ide.jetbrains.util.CliCommand
+import ai.opencode.ide.jetbrains.util.CliVersion
 import ai.opencode.ide.jetbrains.util.PathUtil
 import ai.opencode.ide.jetbrains.util.PortFinder
 import ai.opencode.ide.jetbrains.util.ProcessAuthDetector
@@ -34,13 +40,16 @@ import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.fileEditor.ex.FileEditorManagerEx
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
+import com.intellij.openapi.util.Key
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.util.concurrency.AppExecutorUtil
 
 import org.jetbrains.plugins.terminal.TerminalView
 
+import java.security.SecureRandom
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import java.util.Base64
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
@@ -57,14 +66,18 @@ class OpenCodeService(private val project: Project) : Disposable {
         private const val OPEN_CODE_TAB_PREFIX = "OpenCode"
         private const val RETRY_INTERVAL_MS = 5000L
         private const val BARRIER_TIMEOUT_MS = 2000L
+        private const val V2_SERVER_START_TIMEOUT_MS = 60000L
         internal var DEBOUNCE_MS = 1500L
     }
 
-    private var hostname: String = "127.0.0.1"
-    private var port: Int? = null
-    private var username: String? = null
-    private var password: String? = null
-    private var apiClient: OpenCodeApiClient? = null
+    @Volatile private var hostname: String = "127.0.0.1"
+    @Volatile private var port: Int? = null
+    @Volatile private var username: String? = null
+    @Volatile private var password: String? = null
+    @Volatile private var apiClient: OpenCodeApi? = null
+    @Volatile private var activeProtocol: OpenCodeProtocol = OpenCodeProtocol.UNKNOWN
+    @Volatile private var serverProcess: Process? = null
+    private var basePathOverride: String? = null
     private var sseListener: SseEventListener? = null
     private val isConnected = AtomicBoolean(false)
     private val isConnecting = AtomicBoolean(false)
@@ -96,10 +109,11 @@ class OpenCodeService(private val project: Project) : Disposable {
     private var _sessionManager: SessionManager? = null
     private var _diffViewerService: DiffViewerService? = null
 
-    internal fun setTestDeps(sm: SessionManager, dvs: DiffViewerService, client: OpenCodeApiClient) {
+    internal fun setTestDeps(sm: SessionManager, dvs: DiffViewerService, client: OpenCodeApi) {
         _sessionManager = sm
         _diffViewerService = dvs
         apiClient = client
+        activeProtocol = client.protocol
     }
     
     internal var invokeLater: (Runnable) -> Unit = { 
@@ -159,7 +173,8 @@ class OpenCodeService(private val project: Project) : Disposable {
 
     fun pasteToTerminal(text: String): Boolean {
         if (text.isBlank()) return false
-        apiClient?.let { client -> 
+        val client = apiClient
+        if (client != null && client.protocol != OpenCodeProtocol.V2) {
             AppExecutorUtil.getAppExecutorService().submit { 
                 try { 
                     if (!client.tuiAppendPrompt(text)) logger.warn("[Paste] API failed to append prompt")
@@ -168,6 +183,17 @@ class OpenCodeService(private val project: Project) : Disposable {
                 } 
             }
             return true 
+        }
+        // V2 has no append-prompt endpoint; write directly into the TUI pty.
+        val connector = terminalEditor?.terminalWidget?.processTtyConnector
+        if (connector != null) {
+            return try {
+                connector.write(text)
+                true
+            } catch (e: Exception) {
+                logger.warn("[Paste] Terminal write failed: ${e.message}")
+                false
+            }
         }
         return false
     }
@@ -278,11 +304,14 @@ class OpenCodeService(private val project: Project) : Disposable {
         logger.debug("[OpenCode] Barrier check: ready=$ready, hasId=$hasId, hasPayload=$hasPayload, hasSnapshot=${snapshot != null}")
         
         if (ready && (hasId || hasPayload)) {
+            val messageId = turnMessageIds.remove(sessionId)
+            val payload = turnPendingPayloads.remove(sessionId)
             turnIdleWaiting[sessionId] = false
             turnBarrierTasks.remove(sessionId)?.cancel(false)
+            turnSnapshots.remove(sessionId)
             if (snapshot != null) {
                 logger.info("[OpenCode] Turn #${snapshot.turnNumber} Barrier triggered → fetching diffs")
-                triggerDiffFetch(sessionId, snapshot)
+                triggerDiffFetch(sessionId, snapshot, messageId, payload)
             } else {
                 logger.warn("[OpenCode] Barrier triggered but no snapshot available!")
             }
@@ -299,22 +328,30 @@ class OpenCodeService(private val project: Project) : Disposable {
             val snapshot = turnSnapshots[sessionId]
             if (turnIdleWaiting[sessionId] == true && snapshot != null) {
                 logger.warn("[OpenCode] Turn #${snapshot.turnNumber} Barrier timeout → forcing diff fetch")
+                val messageId = turnMessageIds.remove(sessionId)
+                val payload = turnPendingPayloads.remove(sessionId)
                 turnIdleWaiting[sessionId] = false
-                triggerDiffFetch(sessionId, snapshot)
+                turnSnapshots.remove(sessionId)
+                triggerDiffFetch(sessionId, snapshot, messageId, payload)
             }
             turnBarrierTasks.remove(sessionId)
         }, BARRIER_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         turnBarrierTasks[sessionId] = task
     }
 
-    private fun triggerDiffFetch(sessionId: String, snapshot: TurnSnapshot) {
+    private fun triggerDiffFetch(
+        sessionId: String,
+        snapshot: TurnSnapshot,
+        messageId: String?,
+        payload: List<FileDiff>?
+    ) {
         val now = System.currentTimeMillis()
         if (now - (turnLastTriggerTimes[sessionId] ?: 0) < DEBOUNCE_MS) {
             logger.debug("[OpenCode] Turn #${snapshot.turnNumber} Debounced (too soon)")
             return
         }
         turnLastTriggerTimes[sessionId] = now
-        fetchAndShowDiffs(sessionId, snapshot)
+        fetchAndShowDiffs(sessionId, snapshot, messageId, payload)
     }
 
     private fun forceVfsRefresh(diffs: List<FileDiff>) {
@@ -336,11 +373,15 @@ class OpenCodeService(private val project: Project) : Disposable {
         }
     }
 
-    private fun fetchAndShowDiffs(sessionId: String, snapshot: TurnSnapshot) {
+    private fun fetchAndShowDiffs(
+        sessionId: String,
+        snapshot: TurnSnapshot,
+        messageId: String?,
+        payload: List<FileDiff>?
+    ) {
         val client = apiClient ?: return
-        val path = project.basePath ?: return
-        val messageId = turnMessageIds[sessionId]
-        val payload = turnPendingPayloads[sessionId]
+        val path = basePathOverride ?: project.basePath ?: return
+        val trustServerDiffs = client.protocol == OpenCodeProtocol.V2
         
         logger.info("[OpenCode] Turn #${snapshot.turnNumber} fetchAndShowDiffs: messageId=$messageId, payloadSize=${payload?.size ?: 0}")
         
@@ -348,8 +389,8 @@ class OpenCodeService(private val project: Project) : Disposable {
             try {
                 var diffs: List<FileDiff> = emptyList()
                 
-                // Priority 1: Fetch by messageId (most accurate)
-                if (messageId != null) {
+                // Priority 1: Fetch by messageId (most accurate) or by turn for V2.
+                if (messageId != null || trustServerDiffs) {
                     logger.info("[OpenCode] Turn #${snapshot.turnNumber} Fetching diffs for messageId: $messageId")
                     diffs = client.getSessionDiff(sessionId, path, messageId)
                     logger.info("[OpenCode] Turn #${snapshot.turnNumber} Server returned ${diffs.size} diffs: ${diffs.map { "${it.file}(+${it.additions}/-${it.deletions})" }}")
@@ -385,7 +426,13 @@ class OpenCodeService(private val project: Project) : Disposable {
 
                 // Process using the snapshot via SessionManager (centralized logic)
                 // Pass late VFS events to help with affinity checks
-                val entries = sessionManager.getProcessedDiffs(diffs, snapshot, lateVfsEvents, lateAiCreatedFiles)
+                val entries = sessionManager.getProcessedDiffs(
+                    diffs,
+                    snapshot,
+                    lateVfsEvents,
+                    lateAiCreatedFiles,
+                    trustServerDiffs = trustServerDiffs
+                )
                 
                 if (entries.isNotEmpty()) {
                     sessionManager.updateKnownState(entries.map { it.file })
@@ -399,8 +446,6 @@ class OpenCodeService(private val project: Project) : Disposable {
                 }
             } catch (e: Exception) {
                 logger.error("[OpenCode] Turn #${snapshot.turnNumber} Diff fetch error", e)
-            } finally {
-                turnPendingPayloads.remove(sessionId)
             }
         }
     }
@@ -411,26 +456,66 @@ class OpenCodeService(private val project: Project) : Disposable {
     // ==================== Lifecycle & Connection ====================
 
     private fun initializeApiClient(host: String, port: Int) {
-        val apiHost = if (host == "0.0.0.0") "127.0.0.1" else host
-        apiClient = OpenCodeApiClient(apiHost, port, username, password)
+        val apiHost = apiHost(host)
+        apiClient = when (activeProtocol) {
+            OpenCodeProtocol.V2 -> OpenCodeV2ApiClient(apiHost, port, "opencode", password)
+            OpenCodeProtocol.V1 -> OpenCodeApiClient(apiHost, port, username, password)
+            OpenCodeProtocol.UNKNOWN -> null
+        }
+    }
+
+    private fun createClientForProtocol(
+        protocol: OpenCodeProtocol,
+        host: String,
+        port: Int,
+        user: String?,
+        pwd: String?
+    ): OpenCodeApi {
+        val apiHost = apiHost(host)
+        return if (protocol == OpenCodeProtocol.V2) {
+            OpenCodeV2ApiClient(apiHost, port, "opencode", pwd)
+        } else {
+            OpenCodeApiClient(apiHost, port, user, pwd)
+        }
+    }
+
+    private fun detectAndCreateClient(): OpenCodeApi? {
+        val p = port ?: return null
+        val h = hostname
+        val detection = ProtocolDetector.detect(h, p, username, password)
+        val client = when (detection) {
+            OpenCodeProtocol.V2 -> OpenCodeV2ApiClient(apiHost(h), p, "opencode", password)
+            OpenCodeProtocol.V1 -> OpenCodeApiClient(apiHost(h), p, username, password)
+            OpenCodeProtocol.UNKNOWN -> {
+                logger.warn("[OpenCode] Protocol detection failed for $h:$p, falling back to V1")
+                OpenCodeApiClient(apiHost(h), p, username, password)
+            }
+        }
+        apiClient = client
+        activeProtocol = client.protocol
+        return client
+    }
+
+    private fun apiHost(host: String): String {
+        return if (host == "0.0.0.0" || host == "::") "127.0.0.1" else host
     }
 
     private fun startConnectionManager() {
-        if (connectionManagerTask?.isDone == false || port == null || apiClient == null) return
+        if (connectionManagerTask?.isDone == false || port == null) return
         connectionManagerTask = AppExecutorUtil.getAppScheduledExecutorService().scheduleWithFixedDelay({ if (!project.isDisposed) tryConnect() }, 0, RETRY_INTERVAL_MS, TimeUnit.MILLISECONDS)
     }
 
     private fun tryConnect() {
         if (isConnected.get() || !isConnecting.compareAndSet(false, true)) return
         try {
-            apiClient?.let {
-                if (it.checkHealth(project.basePath!!)) {
-                    remoteReconnectFailures = 0
-                    wasEverConnected = true
-                    connectToSse()
-                } else {
-                    handleConnectionFailure()
-                }
+            val basePath = basePathOverride ?: project.basePath ?: return
+            val client = apiClient ?: detectAndCreateClient() ?: return
+            if (client.checkHealth(basePath)) {
+                remoteReconnectFailures = 0
+                wasEverConnected = true
+                connectToSse()
+            } else {
+                handleConnectionFailure()
             }
         } catch (_: Exception) {
             handleConnectionFailure()
@@ -449,7 +534,17 @@ class OpenCodeService(private val project: Project) : Disposable {
     }
 
     private fun connectToSse() {
-        sseListener?.disconnect(); apiClient?.let { sseListener = it.createEventListener(project.basePath!!, { handleEvent(it) }, { updateConnectionState(false) }, { updateConnectionState(true) }, { updateConnectionState(false) }).apply { connect() } }
+        sseListener?.disconnect()
+        val directory = basePathOverride ?: project.basePath ?: return
+        apiClient?.let {
+            sseListener = it.createEventListener(
+                directory,
+                { event -> handleEvent(event) },
+                { updateConnectionState(false) },
+                { updateConnectionState(true) },
+                { updateConnectionState(false) }
+            ).apply { connect() }
+        }
     }
 
     private fun updateConnectionState(connected: Boolean) { if (isConnected.getAndSet(connected) != connected) connectionListeners.forEach { it(connected) } }
@@ -462,14 +557,19 @@ class OpenCodeService(private val project: Project) : Disposable {
         val time = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
         val message = "[$time] $content"
         invokeLater {
-            if (project.isDisposed) return@invokeLater
-            if (replacePrevious) lastIdleNotification?.expire()
-            val notification = NotificationGroupManager.getInstance()
-                .getNotificationGroup("OpenCode")
-                .createNotification(title, message, type)
-                .setImportant(true)
-            if (replacePrevious) lastIdleNotification = notification
-            notification.notify(project)
+            // Notifications are best-effort: a failure here must never break event handling.
+            try {
+                if (project.isDisposed) return@invokeLater
+                if (replacePrevious) lastIdleNotification?.expire()
+                val notification = NotificationGroupManager.getInstance()
+                    .getNotificationGroup("OpenCode")
+                    .createNotification(title, message, type)
+                    .setImportant(true)
+                if (replacePrevious) lastIdleNotification = notification
+                notification.notify(project)
+            } catch (e: Throwable) {
+                logger.debug("[OpenCode] Notification failed: ${e.message}")
+            }
             try {
                 SystemNotifications.getInstance().notify("OpenCode", title, message)
             } catch (e: Throwable) {
@@ -485,17 +585,45 @@ class OpenCodeService(private val project: Project) : Disposable {
         turnMessageIds.clear(); turnPendingPayloads.clear(); turnSnapshots.clear(); turnIdleWaiting.clear(); turnBarrierTasks.values.forEach { it.cancel(false) }; turnBarrierTasks.clear()
         terminateProcess()
         terminalVirtualFile?.let { OpenCodeTerminalFileEditorProvider.disposeWidget(it, null) }
-        terminalVirtualFile = null; terminalEditor = null; webVirtualFile = null; port = null; hostname = "127.0.0.1"; apiClient = null
+        terminalVirtualFile = null; terminalEditor = null; webVirtualFile = null
+        port = null; hostname = "127.0.0.1"; username = null; password = null
+        apiClient = null; activeProtocol = OpenCodeProtocol.UNKNOWN; basePathOverride = null
     }
 
     private fun terminateProcess() {
         try {
             val process = terminalEditor?.terminalWidget?.processTtyConnector?.process
             if (process?.isAlive == true) {
-                process.destroy()
-                if (!process.waitFor(2, TimeUnit.SECONDS)) process.destroyForcibly()
+                destroyProcessTree(process)
             }
         } catch (_: Exception) {}
+
+        try {
+            val server = serverProcess
+            if (server?.isAlive == true) {
+                destroyProcessTree(server)
+            }
+        } catch (_: Exception) {}
+        serverProcess = null
+    }
+
+    private fun destroyProcessTree(process: Process) {
+        try {
+            if (isWindows()) {
+                ProcessBuilder("taskkill", "/PID", process.pid().toString(), "/T", "/F")
+                    .redirectErrorStream(true)
+                    .start()
+                    .waitFor(3, TimeUnit.SECONDS)
+            } else {
+                process.toHandle().descendants().forEach { it.destroy() }
+                process.destroy()
+            }
+            if (process.isAlive && !process.waitFor(2, TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+            }
+        } catch (_: Exception) {
+            process.destroyForcibly()
+        }
     }
 
     private fun showReconnectOrNewDialog(running: Boolean) {
@@ -526,13 +654,18 @@ class OpenCodeService(private val project: Project) : Disposable {
             val a = if (!pwd.isNullOrBlank()) ProcessAuthDetector.ServerAuth("opencode", pwd) else if (local) ProcessAuthDetector.detectAuthForPort(p) else ProcessAuthDetector.ServerAuth("opencode", null)
             val running = if (local) PortFinder.isOpenCodeRunningOnPort(p, safeH, a.username, a.password) else true
             val occupied = if (local && !running) !PortFinder.isPortAvailable(p) else false
+            val detectedProtocol = if (running) {
+                ProtocolDetector.detect(safeH, p, a.username, a.password)
+            } else {
+                OpenCodeProtocol.UNKNOWN
+            }
 
             ApplicationManager.getApplication().invokeLater {
                 if (running) {
                     lastMode = if (!local) ConnectionMode.REMOTE else if (web) ConnectionMode.WEB else ConnectionMode.TERMINAL
                     // For remote (!local), strict headless unless web mode.
                     // For local, if running, we also just connect (headless or web), we do NOT spawn a new terminal.
-                    connectToExistingServer(safeH, p, a, web, web, customBasePath)
+                    connectToExistingServer(safeH, p, a, web, web, customBasePath, detectedProtocol)
                 } else if (occupied) {
                     val choice = Messages.showYesNoDialog(
                         project,
@@ -544,7 +677,7 @@ class OpenCodeService(private val project: Project) : Disposable {
                     )
                     if (choice == Messages.YES) {
                         lastMode = if (!local) ConnectionMode.REMOTE else if (web) ConnectionMode.WEB else ConnectionMode.TERMINAL
-                        connectToExistingServer(safeH, p, a, web, web, customBasePath)
+                        connectToExistingServer(safeH, p, a, web, web, customBasePath, detectedProtocol)
                     } else {
                         showConnectionDialog()
                     }
@@ -563,11 +696,56 @@ class OpenCodeService(private val project: Project) : Disposable {
         }
     }
 
-    private fun connectToExistingServer(h: String, p: Int, a: ProcessAuthDetector.ServerAuth, ui: Boolean, web: Boolean, customBasePath: String? = null) {
+    private fun connectToExistingServer(
+        h: String,
+        p: Int,
+        a: ProcessAuthDetector.ServerAuth,
+        ui: Boolean,
+        web: Boolean,
+        customBasePath: String? = null,
+        detectedProtocol: OpenCodeProtocol = OpenCodeProtocol.UNKNOWN
+    ) {
+        val protocol = if (detectedProtocol == OpenCodeProtocol.UNKNOWN) {
+            OpenCodeProtocol.V1
+        } else {
+            detectedProtocol
+        }
+
+        // A 2.x server always requires a password. Without it the TUI would exit
+        // immediately with "requires a password; set OPENCODE_PASSWORD", so stop
+        // here and ask the user instead of opening a dead terminal tab.
+        if (protocol == OpenCodeProtocol.V2 && a.password.isNullOrBlank()) {
+            logger.warn("[OpenCode] V2 server $h:$p requires a password but none was provided")
+            ApplicationManager.getApplication().invokeLater {
+                if (project.isDisposed) return@invokeLater
+                Messages.showErrorDialog(
+                    project,
+                    "This OpenCode 2.x server requires a password.\n" +
+                        "Enter the server password (OPENCODE_PASSWORD) in the connection dialog and try again.",
+                    "OpenCode"
+                )
+                showConnectionDialog()
+            }
+            return
+        }
+
         hostname = h; port = p; username = a.username; password = a.password
-        if (ui) { if (web) createWebUI(h, p) else createTerminalUIInternal(h, p, a.password, false, null, customBasePath) }
-        else { ApplicationManager.getApplication().invokeLater { Messages.showInfoMessage(project, "Connected to $h:$p", "OpenCode") } }
-        initializeApiClient(h, p); startConnectionManager()
+        basePathOverride = customBasePath
+        activeProtocol = protocol
+        if (activeProtocol == OpenCodeProtocol.V2) username = "opencode"
+
+        if (ui) {
+            if (web) {
+                createWebUI(h, p)
+            } else {
+                createTerminalUIInternal(h, p, a.password, false, null, customBasePath, activeProtocol)
+            }
+        } else {
+            ApplicationManager.getApplication().invokeLater { Messages.showInfoMessage(project, "Connected to $h:$p", "OpenCode") }
+        }
+
+        apiClient = createClientForProtocol(activeProtocol, h, p, username, password)
+        startConnectionManager()
     }
 
     private fun createWebUI(h: String, p: Int) {
@@ -575,30 +753,23 @@ class OpenCodeService(private val project: Project) : Disposable {
     }
 
     private fun createWebTerminal(h: String, p: Int, pwd: String?, customBasePath: String? = null) {
+        val safeH = normalizeLocalHost(h)
         AppExecutorUtil.getAppExecutorService().submit {
             val bin = detectOpenCodeBinary()
             if (bin == null) {
                 showCliNotFoundError()
                 return@submit
             }
-            ApplicationManager.getApplication().invokeLater {
-                hostname = h; port = p; lastMode = ConnectionMode.WEB
-                createTerminalUIInternal(h, p, pwd, true, bin, customBasePath)
+            if (isV2Cli(bin)) {
+                startV2LocalSession(bin, safeH, p, pwd, customBasePath, web = true)
+                return@submit
             }
-            // Increase timeout to 30s for all platforms
-            if (!PortFinder.waitForPort(p, h, timeoutMs = 30000, requireHealth = true)) {
-                logger.warn("[OpenCode] Initial waitForPort (Web) timed out for $h:$p, starting ConnectionManager anyway")
-            }
-            
-            // Even if it timed out, we might still want the UI and the API client to try reconnecting
-            ApplicationManager.getApplication().invokeLater { createWebUI(h, p) }
-            initializeApiClient(h, p)
-            startConnectionManager()
+            startV1LocalSession(bin, safeH, p, pwd, customBasePath, web = true)
         }
     }
 
     private fun createLocalTerminal(h: String, p: Int, pwd: String?, customBasePath: String? = null) {
-        val safeH = h.trim().ifBlank { "127.0.0.1" }
+        val safeH = normalizeLocalHost(h)
         if (safeH !in listOf("0.0.0.0", "127.0.0.1", "localhost")) {
             // Guard: Never attempt to spawn local terminal for remote host
             connectToExistingServer(safeH, p, ProcessAuthDetector.ServerAuth("opencode", pwd), false, false, customBasePath)
@@ -610,21 +781,165 @@ class OpenCodeService(private val project: Project) : Disposable {
                 showCliNotFoundError()
                 return@submit
             }
-            ApplicationManager.getApplication().invokeLater {
-                hostname = h; port = p; lastMode = ConnectionMode.TERMINAL
-                createTerminalUIInternal(h, p, pwd, true, bin, customBasePath)
+            if (isV2Cli(bin)) {
+                startV2LocalSession(bin, safeH, p, pwd, customBasePath, web = false)
+                return@submit
             }
-            // Increase timeout to 30s for all platforms (Windows startup can be slow)
-            if (!PortFinder.waitForPort(p, h, timeoutMs = 30000)) {
-                logger.warn("[OpenCode] Initial waitForPort timed out for $h:$p, starting ConnectionManager anyway")
-            }
-            
-            initializeApiClient(h, p)
-            startConnectionManager()
+            startV1LocalSession(bin, safeH, p, pwd, customBasePath, web = false)
         }
     }
 
-    private fun createTerminalUIInternal(h: String, p: Int, pwd: String?, cont: Boolean = true, command: String? = null, customBasePath: String? = null) {
+    /**
+     * Legacy OpenCode 1.x flow: a single TUI process exposes the HTTP API itself.
+     */
+    private fun startV1LocalSession(
+        bin: String,
+        h: String,
+        p: Int,
+        pwd: String?,
+        customBasePath: String?,
+        web: Boolean
+    ) {
+        hostname = h
+        port = p
+        activeProtocol = OpenCodeProtocol.V1
+        username = if (pwd.isNullOrBlank()) null else "opencode"
+        password = pwd
+        basePathOverride = customBasePath
+        lastMode = if (web) ConnectionMode.WEB else ConnectionMode.TERMINAL
+
+        ApplicationManager.getApplication().invokeLater {
+            if (project.isDisposed) return@invokeLater
+            createTerminalUIInternal(h, p, pwd, true, bin, customBasePath, OpenCodeProtocol.V1)
+        }
+
+        val healthy = PortFinder.waitForPort(p, h, timeoutMs = 30000, requireHealth = true)
+        if (!healthy) {
+            logger.warn("[OpenCode] Initial waitForPort timed out for $h:$p, starting ConnectionManager anyway")
+        }
+
+        if (web) {
+            ApplicationManager.getApplication().invokeLater { createWebUI(h, p) }
+        }
+
+        apiClient = OpenCodeApiClient(apiHost(h), p, username, password)
+        startConnectionManager()
+    }
+
+    /**
+     * OpenCode 2.x flow: a headless `serve` process provides the HTTP API and a
+     * separate TUI connects to it through `--server`.
+     */
+    private fun startV2LocalSession(
+        bin: String,
+        h: String,
+        p: Int,
+        requestedPassword: String?,
+        customBasePath: String?,
+        web: Boolean
+    ) {
+        val pwd = requestedPassword?.takeIf { it.isNotBlank() } ?: generatePassword()
+        hostname = h
+        port = p
+        username = "opencode"
+        password = pwd
+        activeProtocol = OpenCodeProtocol.V2
+        basePathOverride = customBasePath
+        lastMode = if (web) ConnectionMode.WEB else ConnectionMode.TERMINAL
+
+        val workDir = customBasePath ?: project.basePath
+        if (!startV2Server(bin, h, p, pwd, workDir)) {
+            ApplicationManager.getApplication().invokeLater {
+                if (!project.isDisposed) {
+                    Messages.showErrorDialog(
+                        project,
+                        "Failed to start the OpenCode V2 server on $h:$p.\n" +
+                            "Check the IDE log for details.",
+                        "OpenCode"
+                    )
+                }
+            }
+            return
+        }
+
+        apiClient = OpenCodeV2ApiClient(apiHost(h), p, "opencode", pwd)
+        startConnectionManager()
+
+        ApplicationManager.getApplication().invokeLater {
+            if (project.isDisposed) return@invokeLater
+            if (web) {
+                createWebUI(h, p)
+            } else {
+                createTerminalUIInternal(h, p, pwd, true, bin, customBasePath, OpenCodeProtocol.V2)
+            }
+        }
+    }
+
+    /**
+     * Starts a background `opencode serve` process and waits until the V2 API is
+     * reachable. Returns false when the server could not be started.
+     */
+    private fun startV2Server(bin: String, h: String, p: Int, pwd: String, workDir: String?): Boolean {
+        val args = mutableListOf("serve", "--hostname", h, "--port", p.toString())
+        val command = if (isWindows() && !bin.lowercase().endsWith(".exe")) {
+            listOf("cmd", "/c", bin) + args
+        } else {
+            listOf(bin) + args
+        }
+
+        val process = try {
+            val builder = ProcessBuilder(command)
+            builder.environment()["OPENCODE_PASSWORD"] = pwd
+            if (!workDir.isNullOrBlank()) builder.directory(java.io.File(workDir))
+            builder.redirectErrorStream(true)
+            builder.start()
+        } catch (e: Exception) {
+            logger.warn("[OpenCode] Failed to start V2 server: ${e.message}")
+            return false
+        }
+
+        serverProcess = process
+        consumeProcessOutput(process, "opencode-server")
+
+        if (ProtocolDetector.waitForV2Info(h, p, "opencode", pwd, V2_SERVER_START_TIMEOUT_MS)) {
+            logger.info("[OpenCode] V2 server ready on $h:$p")
+            return true
+        }
+
+        logger.warn(
+            "[OpenCode] V2 server did not become ready on $h:$p within ${V2_SERVER_START_TIMEOUT_MS}ms" +
+                if (!process.isAlive) " (exited with ${process.exitValue()})" else ""
+        )
+        destroyProcessTree(process)
+        serverProcess = null
+        return false
+    }
+
+    private fun consumeProcessOutput(process: Process, tag: String) {
+        Thread {
+            try {
+                process.inputStream.bufferedReader().useLines { lines ->
+                    lines.forEach { line -> logger.debug("[$tag] $line") }
+                }
+            } catch (_: Exception) {
+                // Process ended or stream closed; nothing to do.
+            }
+        }.apply {
+            isDaemon = true
+            name = tag
+            start()
+        }
+    }
+
+    private fun createTerminalUIInternal(
+        h: String,
+        p: Int,
+        pwd: String?,
+        cont: Boolean = true,
+        command: String? = null,
+        customBasePath: String? = null,
+        protocol: OpenCodeProtocol = OpenCodeProtocol.V1
+    ) {
         val t = "$OPEN_CODE_TAB_PREFIX($p)"
         val wd = customBasePath ?: project.basePath
         val w = TerminalView.getInstance(project).createLocalShellWidget(wd, t)
@@ -635,17 +950,84 @@ class OpenCodeService(private val project: Project) : Disposable {
             terminalEditor = FileEditorManager.getInstance(project).openFile(f, true).firstOrNull { it is OpenCodeTerminalFileEditor } as? OpenCodeTerminalFileEditor
             terminalEditor?.let { 
                 val cmd = command ?: getOpenCodeBinary()
-                w.executeCommand(buildOpenCodeCommand(cmd, h, p, pwd, cont)); pinTerminalTab(f)
+                w.executeCommand(buildOpenCodeCommand(cmd, h, p, pwd, cont, protocol)); pinTerminalTab(f)
             }
         }
     }
 
-    private fun buildOpenCodeCommand(command: String, h: String, p: Int, pwd: String?, cont: Boolean): String {
+    private fun buildOpenCodeCommand(
+        command: String,
+        h: String,
+        p: Int,
+        pwd: String?,
+        cont: Boolean,
+        protocol: OpenCodeProtocol = OpenCodeProtocol.V1
+    ): String {
         // Quote command if it contains spaces (e.g. absolute path on Windows)
         val cmdSafe = if (command.contains(" ")) "\"$command\"" else command
-        val base = "$cmdSafe --hostname $h --port $p${if (cont) " --continue" else ""}"
+        val continueFlag = if (cont) " --continue" else ""
+        return if (protocol == OpenCodeProtocol.V2) {
+            // Pass credentials through URL userinfo: environment assignment via
+            // `set VAR=... && cmd` is shell dependent and breaks in PowerShell.
+            val serverUrl = CliCommand.buildServerUrl(h, p, CliCommand.V2_USERNAME, pwd)
+            "$cmdSafe --server $serverUrl$continueFlag"
+        } else {
+            val base = "$cmdSafe --hostname $h --port $p$continueFlag"
+            withPasswordEnv(base, pwd, "OPENCODE_SERVER_PASSWORD")
+        }
+    }
+
+    private fun withPasswordEnv(base: String, pwd: String?, envVar: String): String {
         if (pwd.isNullOrBlank()) return base
-        return if (isWindows()) "cmd /c \"set \"OPENCODE_SERVER_PASSWORD=${pwd.replace("\"", "\\\"")}\" && $base\"" else "OPENCODE_SERVER_PASSWORD='${pwd.replace("'", "'\\''")}' $base"
+        val escaped = pwd.replace("\"", "\\\"")
+        return if (isWindows()) {
+            "cmd /c \"set \"$envVar=$escaped\" && $base\""
+        } else {
+            val shellEscaped = pwd.replace("'", "'\\''")
+            "$envVar='$shellEscaped' $base"
+        }
+    }
+
+    private fun isV2Cli(bin: String): Boolean {
+        val major = detectCliMajorVersion(bin)
+        logger.info("[OpenCode] Detected CLI major version: ${major ?: "unknown"} ($bin)")
+        return major != null && major >= 2
+    }
+
+    /** Reads `opencode --version` and returns the major version, or null when unknown. */
+    private fun detectCliMajorVersion(bin: String): Int? {
+        return try {
+            val output = CapturingProcessHandler(createCliCommandLine(bin, "--version")).runProcess(10000)
+            CliVersion.parseMajor("${output.stdout}\n${output.stderr}")
+        } catch (e: Exception) {
+            logger.debug("[OpenCode] Failed to detect CLI version: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Builds a command line that can execute npm shims on Windows. Java cannot
+     * launch the extensionless / `.cmd` shims directly, so `cmd /c` is required.
+     */
+    private fun createCliCommandLine(bin: String, vararg args: String): GeneralCommandLine {
+        val needsShell = isWindows() && !bin.lowercase().endsWith(".exe")
+        val command = if (needsShell) {
+            listOf("cmd", "/c", bin) + args
+        } else {
+            listOf(bin) + args
+        }
+        return GeneralCommandLine(command)
+    }
+
+    private fun normalizeLocalHost(host: String): String {
+        val trimmed = host.trim().ifBlank { "127.0.0.1" }
+        return if (trimmed == "::") "127.0.0.1" else trimmed
+    }
+
+    private fun generatePassword(): String {
+        val bytes = ByteArray(24)
+        SecureRandom().nextBytes(bytes)
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
     }
 
     @Volatile private var _cachedBinary: String? = null
@@ -772,19 +1154,74 @@ class OpenCodeService(private val project: Project) : Disposable {
         val f = terminalVirtualFile
         if (f != null && OpenCodeTerminalFileEditorProvider.hasWidget(f)) {
             focusTerminalUI()
-        } else {
-            // Terminal UI doesn't exist, need to create new terminal and start opencode
-            try {
-                createTerminalUIInternal(hostname, port ?: return, password, false)
-            } catch (e: Exception) {
-                logger.warn("[OpenCode] Failed to create terminal UI", e)
-                ApplicationManager.getApplication().invokeLater {
-                    Messages.showErrorDialog(project, "Failed to create terminal: ${e.message}", "OpenCode")
+            return
+        }
+        val p = port ?: return
+        val h = hostname
+        if (activeProtocol == OpenCodeProtocol.V2) {
+            AppExecutorUtil.getAppExecutorService().submit {
+                val pwd = password?.takeIf { it.isNotBlank() } ?: generatePassword().also { password = it }
+                username = "opencode"
+                if (ProtocolDetector.probeV2Info(h, p, "opencode", pwd) == null) {
+                    val bin = detectOpenCodeBinary()
+                    if (bin == null) {
+                        showCliNotFoundError()
+                        return@submit
+                    }
+                    if (!startV2Server(bin, h, p, pwd, basePathOverride ?: project.basePath)) {
+                        ApplicationManager.getApplication().invokeLater {
+                            if (!project.isDisposed) {
+                                Messages.showErrorDialog(project, "Failed to restart the OpenCode V2 server on $h:$p.", "OpenCode")
+                            }
+                        }
+                        return@submit
+                    }
                 }
+                apiClient = OpenCodeV2ApiClient(apiHost(h), p, "opencode", pwd)
+                startConnectionManager()
+                ApplicationManager.getApplication().invokeLater {
+                    if (!project.isDisposed) {
+                        createTerminalUIInternal(h, p, pwd, false, null, basePathOverride, OpenCodeProtocol.V2)
+                    }
+                }
+            }
+            return
+        }
+        // Terminal UI doesn't exist, need to create new terminal and start opencode
+        try {
+            createTerminalUIInternal(h, p, password, false, null, basePathOverride, activeProtocol)
+        } catch (e: Exception) {
+            logger.warn("[OpenCode] Failed to create terminal UI", e)
+            ApplicationManager.getApplication().invokeLater {
+                Messages.showErrorDialog(project, "Failed to create terminal: ${e.message}", "OpenCode")
             }
         }
     }
-    private fun ensureWebUi() { if (webVirtualFile != null) focusTerminalUI() else createWebUI(hostname, port ?: return) }
+    private fun ensureWebUi() {
+        if (webVirtualFile != null) {
+            focusTerminalUI()
+            return
+        }
+        val p = port ?: return
+        val h = hostname
+        if (activeProtocol == OpenCodeProtocol.V2) {
+            AppExecutorUtil.getAppExecutorService().submit {
+                val pwd = password ?: return@submit
+                username = "opencode"
+                if (ProtocolDetector.probeV2Info(h, p, "opencode", pwd) == null) {
+                    val bin = detectOpenCodeBinary() ?: return@submit
+                    if (!startV2Server(bin, h, p, pwd, basePathOverride ?: project.basePath)) return@submit
+                }
+                apiClient = OpenCodeV2ApiClient(apiHost(h), p, "opencode", pwd)
+                startConnectionManager()
+                ApplicationManager.getApplication().invokeLater {
+                    if (!project.isDisposed) createWebUI(h, p)
+                }
+            }
+            return
+        }
+        createWebUI(h, p)
+    }
     private fun restoreRemoteConnection() {
         // For remote connections, verify connection is alive and show status
         val p = port ?: return

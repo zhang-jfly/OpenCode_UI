@@ -1,9 +1,9 @@
 package ai.opencode.ide.jetbrains.util
 
+import ai.opencode.ide.jetbrains.api.OpenCodeProtocol
+import ai.opencode.ide.jetbrains.api.ProtocolDetector
 import com.intellij.openapi.diagnostic.Logger
 import java.io.IOException
-import java.net.Proxy
-import java.net.ServerSocket
 
 /**
  * Utility for finding available ports for OpenCode server.
@@ -17,8 +17,6 @@ object PortFinder {
     private val logger = Logger.getInstance(PortFinder::class.java)
     private const val START_PORT = 4096
     private const val MAX_ATTEMPTS = 100
-    private const val CONNECT_TIMEOUT_MS = 5000
-    private const val READ_TIMEOUT_MS = 5000
 
     /**
      * Finds an available port starting from START_PORT.
@@ -73,32 +71,12 @@ object PortFinder {
         username: String? = null,
         password: String? = null
     ): Boolean {
-        return try {
-            val url = java.net.URL("http://$hostname:$port/global/health")
-            val connection = url.openConnection(Proxy.NO_PROXY) as java.net.HttpURLConnection
-            connection.connectTimeout = CONNECT_TIMEOUT_MS
-            connection.readTimeout = READ_TIMEOUT_MS
-            connection.requestMethod = "GET"
-            connection.instanceFollowRedirects = false
-            
-            if (username != null && password != null) {
-                val credentials = "$username:$password"
-                val encodedCredentials = java.util.Base64.getEncoder().encodeToString(credentials.toByteArray())
-                connection.setRequestProperty("Authorization", "Basic $encodedCredentials")
-            }
-            
-            val responseCode = connection.responseCode
-            connection.disconnect()
-            
-            val isHealthy = responseCode == 200 || responseCode == 401 || responseCode == 403
-            if (!isHealthy) {
-                logger.debug("Health check failed for $hostname:$port. Response code: $responseCode")
-            }
-            isHealthy
-        } catch (e: Exception) {
-            logger.debug("Health check failed for $hostname:$port. Error: ${e.message}")
-            false
+        val protocol = ProtocolDetector.detect(hostname, port, username, password)
+        val running = protocol != OpenCodeProtocol.UNKNOWN
+        if (!running) {
+            logger.debug("Health check failed for $hostname:$port: no OpenCode protocol detected")
         }
+        return running
     }
 
     /**

@@ -8,7 +8,16 @@ data class FileDiff(
     val before: String,
     val after: String,
     val additions: Int,
-    val deletions: Int
+    val deletions: Int,
+    /**
+     * Unified diff returned by OpenCode V2. V1 leaves this null and provides
+     * complete before/after bodies instead.
+     */
+    val patch: String? = null,
+    /**
+     * One of `added`, `deleted`, `modified` for V2 diffs.
+     */
+    val status: String? = null
 )
 
 /**
@@ -32,10 +41,12 @@ class FileDiffDeserializer : JsonDeserializer<FileDiff> {
             // 否则会导致：
             // 1. 内容首尾的双引号被错误去除
             // 2. 内容中的反斜杠被错误转义 (e.g. "\\n" -> "\n")
-            before = obj.get("before")?.asString ?: "",
-            after = obj.get("after")?.asString ?: "",
-            additions = obj.get("additions")?.asInt ?: 0,
-            deletions = obj.get("deletions")?.asInt ?: 0
+            before = obj.get("before")?.takeIf { !it.isJsonNull }?.asString ?: "",
+            after = obj.get("after")?.takeIf { !it.isJsonNull }?.asString ?: "",
+            additions = obj.get("additions")?.takeIf { !it.isJsonNull }?.asInt ?: 0,
+            deletions = obj.get("deletions")?.takeIf { !it.isJsonNull }?.asInt ?: 0,
+            patch = obj.get("patch")?.takeIf { !it.isJsonNull }?.asString,
+            status = obj.get("status")?.takeIf { !it.isJsonNull }?.asString
         )
     }
     

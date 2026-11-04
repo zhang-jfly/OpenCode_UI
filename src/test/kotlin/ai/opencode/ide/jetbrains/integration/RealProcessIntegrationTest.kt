@@ -1,10 +1,17 @@
 package ai.opencode.ide.jetbrains.integration
 
 import ai.opencode.ide.jetbrains.OpenCodeService
+import ai.opencode.ide.jetbrains.api.OpenCodeApi
 import ai.opencode.ide.jetbrains.api.OpenCodeApiClient
+import ai.opencode.ide.jetbrains.api.OpenCodeProtocol
+import ai.opencode.ide.jetbrains.api.ProtocolDetector
+import ai.opencode.ide.jetbrains.api.v2.OpenCodeV2ApiClient
 import ai.opencode.ide.jetbrains.diff.DiffViewerService
 import ai.opencode.ide.jetbrains.session.SessionManager
+import ai.opencode.ide.jetbrains.util.CliVersion
 import ai.opencode.ide.jetbrains.util.PortFinder
+import com.intellij.execution.configurations.GeneralCommandLine
+import com.intellij.execution.process.CapturingProcessHandler
 import com.intellij.openapi.components.service
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import java.io.File
@@ -15,24 +22,35 @@ class RealProcessIntegrationTest : BasePlatformTestCase() {
 
     private var process: Process? = null
     private var port: Int = 0
+    private var protocol: OpenCodeProtocol = OpenCodeProtocol.V1
+    private var password: String? = null
 
     override fun setUp() {
         super.setUp()
         // Find an available port first
         port = PortFinder.findAvailablePort()
-        
-        // Find opencode executable
-        val path = System.getenv("PATH").split(File.pathSeparator)
-            .map { File(it, "opencode") }
-            .firstOrNull { it.exists() && it.canExecute() }
-            ?.absolutePath ?: throw IllegalStateException("opencode binary not found in PATH")
 
-        println("Launching opencode: $path serve --port $port")
-        
-        val pb = ProcessBuilder(path, "serve", "--port", "$port")
+        val path = findOpenCodeBinary() ?: throw IllegalStateException("opencode binary not found in PATH")
+        val major = detectMajorVersion(path)
+        protocol = if (major != null && major >= 2) OpenCodeProtocol.V2 else OpenCodeProtocol.V1
+
+        val command = mutableListOf("serve", "--hostname", "127.0.0.1", "--port", "$port")
+        val fullCommand = if (isWindows() && !path.lowercase().endsWith(".exe")) {
+            listOf("cmd", "/c", path) + command
+        } else {
+            listOf(path) + command
+        }
+
+        val pb = ProcessBuilder(fullCommand)
         pb.redirectErrorStream(true)
+        if (protocol == OpenCodeProtocol.V2) {
+            password = "opencode-test-password"
+            pb.environment()["OPENCODE_PASSWORD"] = password
+        }
+
+        println("Launching opencode (${protocol.name}): ${fullCommand.joinToString(" ")}")
         process = pb.start()
-        
+
         // Start a thread to read stdout to prevent blocking and verify startup
         Thread {
             try {
@@ -43,20 +61,73 @@ class RealProcessIntegrationTest : BasePlatformTestCase() {
                 // Ignore stream closed
             }
         }.start()
-        
-        // Wait for port to be open and HEALTHY
-        val ready = PortFinder.waitForPort(port, "127.0.0.1", 15000, true)
+
+        val ready = if (protocol == OpenCodeProtocol.V2) {
+            ProtocolDetector.waitForV2Info("127.0.0.1", port, "opencode", password, 60000)
+        } else {
+            PortFinder.waitForPort(port, "127.0.0.1", 30000, true)
+        }
         if (!ready) {
             throw IllegalStateException("opencode server failed to start on port $port")
         }
     }
 
+    private fun findOpenCodeBinary(): String? {
+        val names = if (isWindows()) {
+            listOf("opencode.exe", "opencode.cmd", "opencode.bat", "opencode")
+        } else {
+            listOf("opencode")
+        }
+        return System.getenv("PATH").orEmpty().split(File.pathSeparator)
+            .asSequence()
+            .flatMap { dir -> names.asSequence().map { File(dir, it) } }
+            .firstOrNull { it.exists() && it.canExecute() }
+            ?.absolutePath
+    }
+
+    private fun detectMajorVersion(bin: String): Int? {
+        return try {
+            val command = if (isWindows() && !bin.lowercase().endsWith(".exe")) {
+                listOf("cmd", "/c", bin, "--version")
+            } else {
+                listOf(bin, "--version")
+            }
+            val output = CapturingProcessHandler(GeneralCommandLine(command)).runProcess(15000)
+            val text = "${output.stdout}\n${output.stderr}".trim()
+            val major = CliVersion.parseMajor(text)
+            println("[RealServer] $bin --version => '$text' (major=$major, exit=${output.exitCode})")
+            major
+        } catch (e: Exception) {
+            println("[RealServer] Failed to detect version of $bin: ${e.message}")
+            null
+        }
+    }
+
+    private fun createClient(): OpenCodeApi {
+        return if (protocol == OpenCodeProtocol.V2) {
+            OpenCodeV2ApiClient("127.0.0.1", port, "opencode", password)
+        } else {
+            OpenCodeApiClient("127.0.0.1", port)
+        }
+    }
+
+    private fun isWindows(): Boolean = System.getProperty("os.name", "").lowercase().contains("windows")
+
     override fun tearDown() {
         try {
-            process?.destroy()
-            process?.waitFor(2, TimeUnit.SECONDS)
-            if (process?.isAlive == true) {
-                process?.destroyForcibly()
+            val p = process
+            if (p != null) {
+                if (isWindows()) {
+                    ProcessBuilder("taskkill", "/PID", p.pid().toString(), "/T", "/F")
+                        .redirectErrorStream(true)
+                        .start()
+                        .waitFor(5, TimeUnit.SECONDS)
+                }
+                p.destroy()
+                p.waitFor(2, TimeUnit.SECONDS)
+                if (p.isAlive) {
+                    p.destroyForcibly()
+                }
             }
         } finally {
             super.tearDown()
@@ -68,7 +139,7 @@ class RealProcessIntegrationTest : BasePlatformTestCase() {
         val sm = project.service<SessionManager>()
         val dvs = project.service<DiffViewerService>()
         
-        val client = OpenCodeApiClient("127.0.0.1", port)
+        val client = createClient()
         
         // Inject dependencies
         service.setTestDeps(sm, dvs, client)
@@ -114,7 +185,7 @@ class RealProcessIntegrationTest : BasePlatformTestCase() {
         val sm = project.service<SessionManager>()
         // We don't really need a real client for this test as we invoke SM methods directly, 
         // but we need to inject dependencies to satisfy the service structure if needed.
-        val client = OpenCodeApiClient("127.0.0.1", port)
+        val client = createClient()
         
         // Mock DiffViewerService to capture entries without trying to open real UI windows
         val mockDiffViewer = object : DiffViewerService(project) {
@@ -215,7 +286,7 @@ class RealProcessIntegrationTest : BasePlatformTestCase() {
     fun testEmptyFileSafety() {
         val service = project.service<OpenCodeService>()
         val sm = project.service<SessionManager>()
-        val client = OpenCodeApiClient("127.0.0.1", port)
+        val client = createClient()
         
         val mockDiffViewer = object : DiffViewerService(project) {
             override fun showMultiFileDiff(entries: List<ai.opencode.ide.jetbrains.api.models.DiffEntry>, initialIndex: Int?) {}

@@ -2,6 +2,7 @@ package ai.opencode.ide.jetbrains.session
 
 import ai.opencode.ide.jetbrains.api.models.DiffEntry
 import ai.opencode.ide.jetbrains.api.models.FileDiff
+import ai.opencode.ide.jetbrains.util.PatchUtil
 import ai.opencode.ide.jetbrains.util.PathUtil
 import java.io.File
 
@@ -338,12 +339,15 @@ open class SessionManager(private val project: Project) : Disposable {
      * Handles Rescue, Resolution, and Filtering in one place (Single Responsibility).
      * @param extraVfsEvents Additional VFS events (e.g. from post-turn refresh) to consider for affinity.
      * @param extraAiCreatedFiles Additional AI created files (from post-turn refresh).
+     * @param trustServerDiffs When true, the server turn diff is authoritative (OpenCode V2).
+     *                         Stale-signal filtering and VFS rescue are skipped.
      */
     fun getProcessedDiffs(
         serverDiffs: List<FileDiff>, 
         snapshot: TurnSnapshot, 
         extraVfsEvents: Set<String> = emptySet(),
-        extraAiCreatedFiles: Set<String> = emptySet()
+        extraAiCreatedFiles: Set<String> = emptySet(),
+        trustServerDiffs: Boolean = false
     ): List<DiffEntry> {
         logger.info("[Turn #${snapshot.turnNumber}] Processing diffs (Server: ${serverDiffs.size})")
         logger.info("[Turn #${snapshot.turnNumber}] Snapshot state:")
@@ -359,33 +363,40 @@ open class SessionManager(private val project: Project) : Disposable {
         // If Server returns a diff that results in NO CHANGE (Before == After),
         // but VFS detected a physical change, it means the Server Diff is stale/wrong.
         // We discard it so that the Rescue logic (Step 1) can generate a correct Synthetic Diff from disk.
-        val validServerDiffs = serverDiffs.filter { diff ->
-            val file = diff.file
-            val isVfsTouched = file in snapshot.vfsChangedFiles || 
-                              file in snapshot.aiCreatedFiles || 
-                              file in snapshot.capturedBeforeContent.keys ||
-                              file in extraVfsEvents ||
-                              file in extraAiCreatedFiles
+        val validServerDiffs = if (trustServerDiffs) {
+            // OpenCode V2 returns the authoritative diff for the turn, including
+            // files that were never observed by the IDE VFS listener.
+            serverDiffs
+        } else {
+            serverDiffs.filter { diff ->
+                val file = diff.file
+                val isVfsTouched = file in snapshot.vfsChangedFiles || 
+                                  file in snapshot.aiCreatedFiles || 
+                                  file in snapshot.capturedBeforeContent.keys ||
+                                  file in extraVfsEvents ||
+                                  file in extraAiCreatedFiles
 
-            if (!isVfsTouched) return@filter true // Keep purely server-side diffs (no VFS conflict)
+                if (!isVfsTouched) return@filter true // Keep purely server-side diffs (no VFS conflict)
 
-            // Resolve before content using the diff as hint
-            val before = resolveBeforeContent(file, diff, snapshot)
-            val after = diff.after
-            
-            if (before == after) {
-                logger.warn("[PreFilter] $file -> DISCARD: Server diff implies no change (len=${before.length}), but VFS changed. Triggering Rescue.")
-                return@filter false
+                // Resolve before content using the diff as hint
+                val before = resolveBeforeContent(file, diff, snapshot)
+                val after = diff.after
+                
+                if (before == after) {
+                    logger.warn("[PreFilter] $file -> DISCARD: Server diff implies no change (len=${before.length}), but VFS changed. Triggering Rescue.")
+                    return@filter false
+                }
+                true
             }
-            true
         }
 
         // 1. VFS Rescue: Find files changed/deleted locally but missed by Server
-        // Only rescue files that have STRONG AI affinity (serverEditedFiles) or physical deletion
+        // Only rescue files that have STRONG AI affinity (serverEditedFiles) or physical deletion.
+        // V2 server diffs are complete, so local rescue would only add noise.
         val rescueCandidates = snapshot.vfsChangedFiles + snapshot.capturedBeforeContent.keys + extraVfsEvents
         val serverFileNames = validServerDiffs.map { it.file }.toSet()
 
-        val vfsMissing = rescueCandidates.filter { vfsFile ->
+        val vfsMissing = if (trustServerDiffs) emptySet() else rescueCandidates.filter { vfsFile ->
             // Skip if Server already returned this file
             if (vfsFile in serverFileNames) {
                 logger.info("[Rescue] $vfsFile -> SKIP: Already in server diffs")
@@ -509,7 +520,7 @@ open class SessionManager(private val project: Project) : Disposable {
                               file in snapshot.capturedBeforeContent.keys ||
                               file in extraVfsEvents
             
-            if (!isServerClaimed && !isVfsTouched) {
+            if (!trustServerDiffs && !isServerClaimed && !isVfsTouched) {
                 logger.info("[DiffFilter] $file -> SKIP: Stale API diff (No SSE or VFS signal in this turn).")
                 return@filter false
             }
@@ -707,6 +718,15 @@ open class SessionManager(private val project: Project) : Disposable {
             }
         }
         
+        // 2.5 V2 patch fallback: V2 diffs carry only a unified patch. Reverse-applying it
+        // reconstructs the original content when no local snapshot is available.
+        if (serverBefore.isEmpty() && !diff.patch.isNullOrBlank()) {
+            PatchUtil.reverseApply(diff.after, diff.patch)?.let {
+                logger.info("[Turn #${snapshot.turnNumber}] Resolved before content for $relativePath from patch")
+                return it
+            }
+        }
+
         // 3. Explicit New File Safety: If server says before is empty and intent is Create (after not empty),
         // we MUST trust the server IF we failed to find local history. 
         // This prevents reading the AI's newly written content from disk as the "before" state.

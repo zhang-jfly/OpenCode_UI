@@ -65,8 +65,13 @@ object ProcessAuthDetector {
                 // So if it's named "opencode", it's our target. No need to check for "serve" or "web" args,
                 // as the user might run it in TUI mode or other future modes.
                 if (isOpenCodeProcess) {
-                    val password = extractEnvVar(line, "OPENCODE_SERVER_PASSWORD")
-                    val username = extractEnvVar(line, "OPENCODE_SERVER_USERNAME") ?: "opencode"
+                    val v2Password = extractEnvVar(line, "OPENCODE_PASSWORD")
+                    val password = v2Password ?: extractEnvVar(line, "OPENCODE_SERVER_PASSWORD")
+                    val username = if (v2Password != null) {
+                        "opencode"
+                    } else {
+                        extractEnvVar(line, "OPENCODE_SERVER_USERNAME") ?: "opencode"
+                    }
                     
                     if (password != null) {
                         // Note: Password is not logged for security reasons
@@ -163,7 +168,7 @@ object ProcessAuthDetector {
             // PowerShell command to get environment variables of a process
             val psCommand = """
                 (Get-Process -Id $pid).StartInfo.EnvironmentVariables | 
-                Where-Object { ${'$'}_.Key -like 'OPENCODE_SERVER_*' } | 
+                Where-Object { ${'$'}_.Key -like 'OPENCODE_*' } | 
                 ForEach-Object { "${'$'}(${'$'}_.Key)=${'$'}(${'$'}_.Value)" }
             """.trimIndent()
             
@@ -171,9 +176,13 @@ object ProcessAuthDetector {
             
             var password: String? = null
             var username: String? = null
+            var v2Password = false
             
             for (line in output.stdoutLines) {
-                if (line.startsWith("OPENCODE_SERVER_PASSWORD=")) {
+                if (line.startsWith("OPENCODE_PASSWORD=")) {
+                    password = line.substringAfter("=")
+                    v2Password = true
+                } else if (line.startsWith("OPENCODE_SERVER_PASSWORD=") && password == null) {
                     password = line.substringAfter("=")
                 } else if (line.startsWith("OPENCODE_SERVER_USERNAME=")) {
                     username = line.substringAfter("=")
@@ -181,8 +190,9 @@ object ProcessAuthDetector {
             }
             
             if (password != null) {
-                logger.info("Detected authentication via PowerShell: username=${username ?: "opencode"}")
-                return ServerAuth(username ?: "opencode", password)
+                val resolvedUser = if (v2Password) "opencode" else (username ?: "opencode")
+                logger.info("Detected authentication via PowerShell: username=$resolvedUser")
+                return ServerAuth(resolvedUser, password)
             }
             
             logger.debug("PowerShell could not retrieve environment variables, falling back to no-auth")

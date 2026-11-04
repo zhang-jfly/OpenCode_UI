@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "ai.opencode"
-version = "1.1.0"
+version = "1.2.0"
 
 repositories {
     mavenCentral()
@@ -41,7 +41,7 @@ intellijPlatform {
         }
 
         changeNotes = """
-            <h2>1.1.0</h2>
+            <h2>1.2.0</h2>
             <ul>
                 <li>New: Custom base path support — added a "Custom base path" dropdown in the connection dialog, allowing users to specify a working directory for OpenCode terminal sessions. Automatically populated with detected project modules.</li>
                 <li>Fix: Fixed the OpenCode CLI install command in README to match official download instructions.</li>

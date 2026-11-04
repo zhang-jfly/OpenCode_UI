@@ -42,8 +42,15 @@ open class DiffViewerService(private val project: Project) : Disposable {
         val total = entries.size
         val requests = entries.mapIndexed { index, entry ->
             val fileType = FileTypeManager.getInstance().getFileTypeByFileName(entry.file)
-            val title = "[${index + 1}/$total] ${entry.file}"
-            val afterTitle = if (entry.hasUserEdits) "Modified (OpenCode + User)" else "Modified (OpenCode)"
+            // V2 diffs report an explicit added/deleted/modified status; V1 keeps the legacy titles.
+            val statusLabel = if (entry.diff.status != null) entry.statusLabel else "Modified"
+            val statusSuffix = if (entry.diff.status != null) " ($statusLabel)" else ""
+            val title = "[${index + 1}/$total] ${entry.file}$statusSuffix"
+            val afterTitle = if (entry.hasUserEdits) {
+                "$statusLabel (OpenCode + User)"
+            } else {
+                "$statusLabel (OpenCode)"
+            }
 
             // Use pre-resolved before content (no LocalHistory call on EDT)
             val beforeText = entry.beforeContent

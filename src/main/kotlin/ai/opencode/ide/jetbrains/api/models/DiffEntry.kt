@@ -29,8 +29,16 @@ data class DiffEntry(
      * This prevents "Replace" operations (Delete+Create) from being treated as New Files,
      * ensuring Reject restores the original content instead of deleting the file.
      */
-    val isNewFile: Boolean get() = isCreatedExplicitly && diff.before.isEmpty()
-    
+    val isNewFile: Boolean get() = (isCreatedExplicitly || diff.status == "added") && diff.before.isEmpty()
+
     /** Get the before content: prefer resolved, fallback to server-provided */
     val beforeContent: String get() = resolvedBefore ?: diff.before
+
+    /** Human-readable change status for the diff window title. */
+    val statusLabel: String
+        get() = when (diff.status) {
+            "added" -> "Added"
+            "deleted" -> "Deleted"
+            else -> "Modified"
+        }
 }

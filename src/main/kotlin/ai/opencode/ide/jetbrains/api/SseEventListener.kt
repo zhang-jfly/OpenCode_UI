@@ -3,6 +3,8 @@ package ai.opencode.ide.jetbrains.api
 import ai.opencode.ide.jetbrains.api.models.OpenCodeEvent
 import ai.opencode.ide.jetbrains.api.models.OpenCodeEventDeserializer
 import com.google.gson.GsonBuilder
+import com.google.gson.JsonDeserializer
+import com.google.gson.JsonParser
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.util.concurrency.AppExecutorUtil
 import okhttp3.*
@@ -22,7 +24,10 @@ class SseEventListener(
     private val onConnected: () -> Unit = {},
     private val onDisconnected: () -> Unit = {},
     private val username: String? = null,
-    private val password: String? = null
+    private val password: String? = null,
+    private val eventPath: String = "/event",
+    private val appendDirectory: Boolean = true,
+    deserializer: JsonDeserializer<OpenCodeEvent> = OpenCodeEventDeserializer()
 ) {
     private val logger = Logger.getInstance(SseEventListener::class.java)
 
@@ -47,7 +52,7 @@ class SseEventListener(
         .build()
 
     private val gson = GsonBuilder()
-        .registerTypeAdapter(OpenCodeEvent::class.java, OpenCodeEventDeserializer())
+        .registerTypeAdapter(OpenCodeEvent::class.java, deserializer)
         .create()
 
     private var call: Call? = null
@@ -65,8 +70,12 @@ class SseEventListener(
 
     private fun doConnect() {
         reconnectAttemptCount++
-        val encodedPath = java.net.URLEncoder.encode(projectPath, "UTF-8")
-        val url = "$baseUrl/event?directory=$encodedPath"
+        val url = if (appendDirectory) {
+            val encodedPath = java.net.URLEncoder.encode(projectPath, "UTF-8")
+            "$baseUrl$eventPath?directory=$encodedPath"
+        } else {
+            "$baseUrl$eventPath"
+        }
 
         logger.info("[SSE] Connecting to $url (attempt #$reconnectAttemptCount)...")
         val request = Request.Builder()
@@ -103,13 +112,33 @@ class SseEventListener(
 
                 response.body?.source()?.let { source ->
                     try {
+                        var currentEvent: String? = null
+                        val dataBuffer = StringBuilder()
+
+                        fun dispatchBuffered() {
+                            if (dataBuffer.isNotEmpty()) {
+                                parseAndDispatchEvent(dataBuffer.toString(), currentEvent)
+                                dataBuffer.setLength(0)
+                            }
+                            currentEvent = null
+                        }
+
                         while (!source.exhausted() && !call.isCanceled()) {
                             val line = source.readUtf8Line() ?: break
-                            if (line.startsWith("data:")) {
-                                val json = line.substring(5).trim()
-                                if (json.isNotEmpty()) parseAndDispatchEvent(json)
+                            when {
+                                line.startsWith("event:") -> {
+                                    currentEvent = line.substring(6).trim()
+                                }
+                                line.startsWith("data:") -> {
+                                    val chunk = line.substring(5)
+                                    val value = if (chunk.startsWith(" ")) chunk.substring(1) else chunk
+                                    if (dataBuffer.isNotEmpty()) dataBuffer.append('\n')
+                                    dataBuffer.append(value)
+                                }
+                                line.isEmpty() -> dispatchBuffered()
                             }
                         }
+                        dispatchBuffered()
                     } catch (e: Exception) {
                         if (!call.isCanceled()) logger.warn("[SSE] Stream interrupted: ${e.message}")
                     } finally {
@@ -125,13 +154,26 @@ class SseEventListener(
         })
     }
 
-    private fun parseAndDispatchEvent(json: String) {
-        try {
+    private fun parseAndDispatchEvent(json: String, eventName: String?) {
+        val event = try {
             logger.debug("[SSE-Raw] $json")
-            val event = gson.fromJson(json, OpenCodeEvent::class.java)
-            if (event != null) onEvent(event)
+            val element = JsonParser.parseString(json)
+            if (element.isJsonObject && !eventName.isNullOrBlank()) {
+                val obj = element.asJsonObject
+                if (!obj.has("type")) obj.addProperty("type", eventName)
+            }
+            gson.fromJson(element, OpenCodeEvent::class.java)
         } catch (e: Exception) {
             logger.debug("[SSE] Parse error: ${e.message}. JSON: $json")
+            return
+        }
+
+        if (event == null) return
+        try {
+            onEvent(event)
+        } catch (e: Exception) {
+            // A failing handler must not break the SSE loop: log and keep listening.
+            logger.warn("[SSE] Event handler failed for ${event.type}: ${e.message}", e)
         }
     }
 
